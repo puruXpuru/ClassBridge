@@ -26,28 +26,18 @@ import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * Created by cys on 6/20/18.
+ * Created by puruXpuru on 6/20/18.
  */
 
 public class ClassBridge {
 
-
-    @Target(ElementType.METHOD)
-    @Retention(RetentionPolicy.RUNTIME)
-    public @interface Run {
-        String tag() default "";
-
-        int threadMode() default SelfThread;
-    }
-
-    @Target(ElementType.FIELD)
     @Retention(RetentionPolicy.RUNTIME)
     public @interface Tag {
         String tag() default "";
 
         int threadMode() default SelfThread;
 
-        boolean set() default false; // get or set
+        boolean setter() default false; // get or set
     }
 
     private static class TagNode implements Serializable {
@@ -70,8 +60,6 @@ public class ClassBridge {
     // mark down the classes.
     public static void mark(Object instance) {
 
-        //String name = instance.getClass().getName();
-        //classes.put(name, instance);
         final Class c = instance.getClass();
         Field[] fields = c.getDeclaredFields();
         for (Field f : fields) {
@@ -84,7 +72,7 @@ public class ClassBridge {
                     tn.threadMode = t.threadMode();
                     tn.isMethod = false;
                     tn.object = f;
-                    tn.isSetter = t.set();
+                    tn.isSetter = t.setter();
                     tn.tag = t.tag();
                     tn.instance = instance;
                     if (tn.tag.length() == 0) {
@@ -100,9 +88,9 @@ public class ClassBridge {
         for (Method m : methods) {
             Annotation[] annos = m.getAnnotations();
             for (Annotation anno : annos) {
-                if (anno instanceof Run) {
+                if (anno instanceof Tag) {
                     m.setAccessible(true);
-                    Run r = (Run) anno;
+                    Tag r = (Tag) anno;
                     TagNode tn = new TagNode();
                     tn.threadMode = r.threadMode();
                     tn.isMethod = true;
