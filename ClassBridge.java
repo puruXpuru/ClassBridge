@@ -9,14 +9,19 @@ import android.support.annotation.NonNull;
 
 import java.io.Serializable;
 import java.lang.annotation.Annotation;
-import java.lang.annotation.ElementType;
 import java.lang.annotation.Retention;
 import java.lang.annotation.RetentionPolicy;
-import java.lang.annotation.Target;
+import java.lang.reflect.AccessibleObject;
 import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.ConcurrentSkipListSet;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -25,6 +30,8 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 
+import static okhttp3.internal.Internal.instance;
+
 /**
  * Created by puruXpuru on 6/20/18.
  */
@@ -32,30 +39,83 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public class ClassBridge {
 
     @Retention(RetentionPolicy.RUNTIME)
-    public @interface Tag {
+    public @interface Tag{
+        /**
+         * When the value of tag is empty, it will use the name of the elements
+         * who is tagged as a tag value, be careful if the name
+         * isn't the unique one in the marked classes, the prior one will be overrode.
+         * */
         String tag() default "";
 
+        /**
+         * @see ClassBridge#SelfThread
+         */
         int threadMode() default SelfThread;
 
+        /**
+         * Ignored when it's tagged on method,
+         * flag it as a setter or getter, default as getter
+         */
         boolean setter() default false; // get or set
     }
 
-    private static class TagNode implements Serializable {
+    @Retention(RetentionPolicy.RUNTIME)
+    public @interface Subscribe {
+        /**
+         * @see Tag#tag()
+         * */
+        String tag() default "";
+
+        /**
+         * @see Tag#threadMode()
+         * */
+        int threadMode() default SelfThread;
+
+        /**
+         * @see Tag#setter()
+         * */
+        boolean setter() default false; // get or set
+    }
+
+    private static class TagNode implements Serializable, Comparable<TagNode> {
         String tag;
         boolean isMethod;
         int threadMode;
         Object instance;
         Object object;
         boolean isSetter;
+
+        @Override
+        public int compareTo(@NonNull TagNode tagNode) {
+            if(Objects.equals(tag, tagNode.tag) && this.object == tagNode.object
+                    && isSetter == tagNode.isSetter && this.isMethod == tagNode.isMethod)
+                return 0;
+            return 1;
+        }
     }
 
+
+    /**
+     * Pass the invoking information to a Handler, for run on the ui thread
+     */
     public final static int UIThread = 0;
+
+    /**
+     * Create a new thread to run
+     */
     public final static int NewThread = 1;
+
+    /**
+     * Run on the current thread who invoked it.
+     */
     public final static int SelfThread = 2;
 
-    static ConcurrentHashMap<String, TagNode> tags = new ConcurrentHashMap<>();
-    static ExecutorService executor = Executors.newFixedThreadPool(5);
-    static ClassBridge classBridge = new ClassBridge();
+    private static ConcurrentHashMap<String, TagNode> tags = new ConcurrentHashMap<>();
+    private static ConcurrentHashMap<String, ConcurrentSkipListSet<TagNode>> subscribers =
+            new ConcurrentHashMap<>();
+    private static ConcurrentMap<String, Object[]> publishedKeeper = new ConcurrentHashMap<>();
+    private static ExecutorService executor = Executors.newFixedThreadPool(5);
+    private static ClassBridge classBridge = new ClassBridge();
 
     // mark down the classes.
     public static void mark(Object instance) {
@@ -64,67 +124,129 @@ public class ClassBridge {
         Field[] fields = c.getDeclaredFields();
         for (Field f : fields) {
             Annotation[] annos = f.getAnnotations();
-            for (Annotation anno : annos) {
-                if (anno instanceof Tag) {
-                    f.setAccessible(true);
-                    Tag t = (Tag) anno;
-                    TagNode tn = new TagNode();
-                    tn.threadMode = t.threadMode();
-                    tn.isMethod = false;
-                    tn.object = f;
-                    tn.isSetter = t.setter();
-                    tn.tag = t.tag();
-                    tn.instance = instance;
-                    if (tn.tag.length() == 0) {
-                        tn.tag = f.getName();
-                    }
-                    tags.put(tn.tag, tn);
-                }
-            }
+            if(annos.length == 0)
+                continue;
 
+            markWithAnnotations(annos, false, f, f.getName(), instance);
         }
 
         Method[] methods = c.getDeclaredMethods();
+        MarkMethods:
         for (Method m : methods) {
             Annotation[] annos = m.getAnnotations();
-            for (Annotation anno : annos) {
-                if (anno instanceof Tag) {
-                    m.setAccessible(true);
-                    Tag r = (Tag) anno;
-                    TagNode tn = new TagNode();
-                    tn.threadMode = r.threadMode();
-                    tn.isMethod = true;
-                    tn.object = m;
-                    tn.tag = r.tag();
-                    tn.instance = instance;
-                    if (tn.tag.length() == 0) {
-                        tn.tag = m.getName();
-                    }
-                    tags.put(tn.tag, tn);
-                }
-            }
+            if(annos.length == 0)
+                continue;
+
+            markWithAnnotations(annos, true, m, m.getName(), instance);
         }
 
     }
 
-    public static void remove(String tag) {
-        tags.remove(tag);
+
+    private static void markWithAnnotations(Annotation[] annos, boolean isMethod,
+                                            AccessibleObject accessibleObject,
+                                            String objectName, Object instance){
+        MarkAnno:
+        for (Annotation anno : annos) {
+            do{
+                if(!(anno instanceof Tag) && !(anno instanceof Subscribe))
+                    continue MarkAnno;
+                TagNode tn = new TagNode();
+                tn.object = accessibleObject;
+                tn.isMethod = isMethod;
+                tn.instance = instance;
+                accessibleObject.setAccessible(true);
+
+                if (anno instanceof Tag) {
+                    Tag t = (Tag) anno;
+                    tn.tag = t.tag();
+                    if (tn.tag.length() == 0) {
+                        tn.tag = objectName;//f.getName();
+                    }
+                    tn.isSetter = t.setter();
+                    tn.threadMode = t.threadMode();
+                    tags.put(tn.tag, tn);
+                } else  {
+                    Subscribe t = (Subscribe) anno;
+                    tn.tag = t.tag();
+                    if (tn.tag.length() == 0) {
+                        tn.tag = objectName;//fgetName();
+                    }
+                    tn.isSetter = t.setter();
+                    tn.threadMode = t.threadMode();
+                    addToSubscribers(tn);
+                }
+                continue MarkAnno;
+
+            }while(false);
+        }
     }
 
-    public static void removeAll() {
-        tags.clear();
+    private static void addToSubscribers(TagNode tagNode){
+        ConcurrentSkipListSet<TagNode> set = subscribers.get(tagNode.tag);
+        if(set == null){
+            set = new ConcurrentSkipListSet<>();
+            subscribers.put(tagNode.tag, set);
+        }
+        set.add(tagNode);
+        Object[] cached = publishedKeeper.get(tagNode.tag);
+        if(cached != null){
+            classBridge.new Bridge(tagNode).setArgs(cached).exec();
+        }
     }
 
-
-    // call a method with the given args and return its result,
-    // or either get the field value or set field value with the first argument.
-    public static Future<Object> run(String tag, Object... args) {
+    /**
+     * call a method with the given args and return its result,
+     * if it's a field will either get the field value or
+     * set the value of the field with the first argument.
+     */
+    public static Future<Object> run(String tag, Object...args) {
         TagNode tn = tags.get(tag);
         if (tn == null)
             return null;
 
         Bridge bridge = classBridge.new Bridge(tn).setArgs(args);
         return bridge.exec();
+    }
+
+    /**
+     * It will remove the args has been cached, dut to the cached value should be newest usually.
+     * */
+    public static void publish(String tag, Object...args){
+
+        publishedKeeper.remove(tag);
+        ConcurrentSkipListSet<TagNode> set = subscribers.get(tag);
+        if(set == null)
+            return;
+        for(TagNode tn: set){
+            classBridge.new Bridge(tn).setArgs(args).exec();
+        }
+    }
+
+    /**
+     * @param cache cache the args of published, when a new subscriber is marked
+     *              will automatically push the cached value to it.
+     * */
+    public static void publishAndCache(String tag, boolean cache, Object...args){
+        publish(tag, args);
+        if(cache)
+            publishedKeeper.put(tag, args);
+    }
+
+    public static void removeTag(String tag) {
+        tags.remove(tag);
+    }
+
+    public static void removeAllTags() {
+        tags.clear();
+    }
+
+    public static void removeCache(String tag){
+        publishedKeeper.remove(tag);
+    }
+
+    public static void removeAllCache(String tag){
+        publishedKeeper.clear();
     }
 
 
@@ -225,7 +347,6 @@ public class ClassBridge {
 
     private class BridgeFuture implements Future<Object> {
 
-        private AtomicBoolean blocking = new AtomicBoolean(false);
         private AtomicBoolean cancelled = new AtomicBoolean(false);
         private AtomicBoolean done = new AtomicBoolean(false);
         private ConditionVariable cv = new ConditionVariable();
@@ -236,7 +357,6 @@ public class ClassBridge {
         public boolean set(Object result) {
             if (isCancelled() && cancelledWithInterruption) {
                 cv.open();
-                //tryNotify();
                 return false;
             }
 
