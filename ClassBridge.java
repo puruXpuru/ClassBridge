@@ -11,6 +11,7 @@ import java.io.Serializable;
 import java.lang.annotation.Annotation;
 import java.lang.annotation.Retention;
 import java.lang.annotation.RetentionPolicy;
+import java.lang.ref.WeakReference;
 import java.lang.reflect.AccessibleObject;
 import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
@@ -81,16 +82,18 @@ public class ClassBridge {
         String tag;
         boolean isMethod;
         int threadMode;
-        Object instance;
         Object object;
         boolean isSetter;
+        WeakReference<Object> refInstance;
 
         @Override
         public int compareTo(@NonNull TagNode tagNode) {
-            if(Objects.equals(tag, tagNode.tag) && this.object == tagNode.object
-                    && isSetter == tagNode.isSetter && this.isMethod == tagNode.isMethod)
-                return 0;
-            return 1;
+            if(Objects.equals(tag, tagNode.tag)
+                    && this.object == tagNode.object
+                    && isSetter == tagNode.isSetter
+                    && this.isMethod == tagNode.isMethod)
+                return 1;
+            return 0;
         }
     }
 
@@ -113,6 +116,10 @@ public class ClassBridge {
     private static ConcurrentHashMap<String, TagNode> tags = new ConcurrentHashMap<>();
     private static ConcurrentHashMap<String, ConcurrentSkipListSet<TagNode>> subscribers =
             new ConcurrentHashMap<>();
+    /**
+     * Cache the Args was published, when there is a new subscription,
+     * it will be automatically informed with the cached publications.
+     * */
     private static ConcurrentMap<String, Object[]> publishedKeeper = new ConcurrentHashMap<>();
     private static ExecutorService executor = Executors.newFixedThreadPool(5);
     private static ClassBridge classBridge = new ClassBridge();
@@ -154,7 +161,7 @@ public class ClassBridge {
                 TagNode tn = new TagNode();
                 tn.object = accessibleObject;
                 tn.isMethod = isMethod;
-                tn.instance = instance;
+                tn.refInstance = new WeakReference<>(instance);
                 accessibleObject.setAccessible(true);
 
                 if (anno instanceof Tag) {
@@ -195,6 +202,10 @@ public class ClassBridge {
         }
     }
 
+    private static boolean checkInstanceIsRecycled(TagNode tn){
+        return tn.refInstance.get() == null;
+    }
+
     /**
      * call a method with the given args and return its result,
      * if it's a field will either get the field value or
@@ -204,6 +215,11 @@ public class ClassBridge {
         TagNode tn = tags.get(tag);
         if (tn == null)
             return null;
+
+        if(checkInstanceIsRecycled(tn)){
+            tags.remove(tn.tag);
+            return null;
+        }
 
         Bridge bridge = classBridge.new Bridge(tn).setArgs(args);
         return bridge.exec();
@@ -219,6 +235,9 @@ public class ClassBridge {
         if(set == null)
             return;
         for(TagNode tn: set){
+            if(checkInstanceIsRecycled(tn)){
+                continue;
+            }
             classBridge.new Bridge(tn).setArgs(args).exec();
         }
     }
@@ -269,10 +288,13 @@ public class ClassBridge {
 
         private void invokeOrSetOrGet() {
 
+            Object instance = tn.refInstance.get();
+            if(instance == null)
+                return;
             if (tn.isMethod) {
                 Method m = (Method) tn.object;
                 try {
-                    Object r = m.invoke(tn.instance, args);
+                    Object r = m.invoke(instance, args);
                     future.set(r);
                 } catch (IllegalAccessException | InvocationTargetException e) {
                     e.printStackTrace();
@@ -282,7 +304,7 @@ public class ClassBridge {
                     return;
                 Field f = (Field) tn.object;
                 try {
-                    f.set(tn.instance, args[0]);
+                    f.set(instance, args[0]);
                     // still set it though run a setter will not has a result.
                     // for preventing from blocking forever by future.get();
                     future.set(null);
@@ -292,7 +314,7 @@ public class ClassBridge {
             } else {
                 Field f = (Field) tn.object;
                 try {
-                    Object r = f.get(tn.instance);
+                    Object r = f.get(instance);
                     future.set(r);
                 } catch (IllegalAccessException e) {
                     e.printStackTrace();
@@ -309,7 +331,7 @@ public class ClassBridge {
             }
         }
 
-        public Future<Object> exec() {
+        public @NonNull Future<Object> exec() {
             switch (tn.threadMode) {
 
                 case UIThread: {
